@@ -1,0 +1,160 @@
+name: Compile KT to Smali
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-smali:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: 4. Buat Project & Stub SystemProperties Otomatis
+        run: |
+          mkdir -p app/src/main/java/com/android/axion/compose/about
+          mkdir -p app/src/main/java/android/os
+          mkdir -p app/libs
+
+          # Pindahkan AxionAboutScreen.kt ke struktur package
+          cp AxionAboutScreen.kt app/src/main/java/com/android/axion/compose/about/
+
+          # Buat stub android.os.SystemProperties agar hidden API bisa ter-compile
+          cat << 'EOF' > app/src/main/java/android/os/SystemProperties.java
+          package android.os;
+          public class SystemProperties {
+              public static String get(String key, String def) {
+                  return def;
+              }
+          }
+          EOF
+
+          # Buat AndroidManifest.xml minimal
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+          EOF
+
+          # Buat settings.gradle.kts
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AxionSmaliBuilder"
+          include(":app")
+          EOF
+
+          # Cek apakah user mengunggah file .dex dari APK target
+          if compgen -G "*.dex" > /dev/null; then
+              echo "File .dex ditemukan! Mengonversi .dex ke .jar..."
+              curl -L -o dex-tools.zip https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip
+              unzip -q dex-tools.zip
+              chmod +x dex-tools-v2.4/*.sh
+              for dexfile in *.dex; do
+                  ./dex-tools-v2.4/d2j-dex2jar.sh "$dexfile" -o "app/libs/${dexfile%.dex}.jar"
+              done
+              DEPS='compileOnly(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))'
+          else
+              echo "Menggunakan dependensi Jetpack Compose standar..."
+              DEPS='
+              val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+              implementation(composeBom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              '
+          fi
+
+          # Buat app/build.gradle.kts
+          cat << EOF > app/build.gradle.kts
+          plugins {
+              id("com.android.library") version "8.7.2"
+              id("org.jetbrains.kotlin.android") version "2.0.21"
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
+          }
+
+          android {
+              namespace = "com.android.axion.compose.about"
+              compileSdk = 35
+
+              defaultConfig {
+                  minSdk = 31
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+          }
+
+          dependencies {
+              $DEPS
+          }
+          EOF
+
+      - name: 5. Compile Kotlin ke Bytecode (.class)
+        run: |
+          gradle :app:compileDebugKotlin
+
+      - name: 6. Konversi .class ke .dex dan .smali (Baksmali)
+        run: |
+          mkdir -p out_dex out_smali
+
+          # Cari d8 dan android.jar terbaru di runner GitHub
+          D8=$(ls $ANDROID_HOME/build-tools/*/d8 | sort -V | tail -n 1)
+          ANDROID_JAR=$(ls $ANDROID_HOME/platforms/android-*/android.jar | sort -V | tail -n 1)
+
+          # Hanya ambil class dari package com/android/axion/compose/about (tanpa stub SystemProperties)
+          $D8 app/build/tmp/kotlin-classes/debug/com/android/axion/compose/about/*.class \
+              --lib "$ANDROID_JAR" \
+              --min-api 31 \
+              --output out_dex/
+
+          # Download Baksmali untuk decompile classes.dex ke .smali
+          curl -L -o baksmali.jar https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar
+          java -jar baksmali.jar d out_dex/classes.dex -o out_smali/
+
+          echo "=== Daftar File Smali yang Dihasilkan ==="
+          ls -la out_smali/com/android/axion/compose/about/
+
+      - name: 7. Upload Hasil Smali & Dex
+        uses: actions/upload-artifact@v4
+        with:
+          name: -Smali-Dex
+          path: |
+            out_smali/
+            out_dex/classes.dex
+            
